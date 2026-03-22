@@ -20,7 +20,11 @@ class SparseIndex:
         self._offsets: list[Offset] = []
 
     def add(self, first_key: Key, block_offset: Offset) -> None:
-        """Append a new index entry (must be called in key order)."""
+        """Append a new index entry. Keys must be in ascending order."""
+        if self._keys and first_key <= self._keys[-1]:
+            raise ValueError(
+                f"Keys must be ascending: {first_key!r} <= {self._keys[-1]!r}"
+            )
         self._keys.append(first_key)
         self._offsets.append(block_offset)
 
@@ -62,9 +66,9 @@ class SparseIndex:
 
     def next_offset_after(self, offset: Offset) -> Offset | None:
         """Return the first offset strictly greater than *offset*, or None."""
-        for o in self._offsets:
-            if o > offset:
-                return o
+        idx = bisect.bisect_right(self._offsets, offset)
+        if idx < len(self._offsets):
+            return self._offsets[idx]
         return None
 
     def __len__(self) -> int:

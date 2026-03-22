@@ -46,6 +46,8 @@ class WALManager:
         return mgr
 
     # ── sync write path (for use under external lock) ────────────────────
+    # BUG-18 LOCK ORDER: caller holds _mem.write_lock → _wal_lock acquired here.
+    # Never acquire _mem.write_lock from within _wal_lock.
 
     def sync_append(self, entry: WALEntry) -> None:
         """Synchronous append for use under external lock."""

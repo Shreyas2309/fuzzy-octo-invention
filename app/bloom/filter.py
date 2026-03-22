@@ -12,6 +12,7 @@ from typing import Final
 
 import mmh3
 
+from app.common.errors import CorruptRecordError
 from app.types import Key
 
 # ---------------------------------------------------------------------------
@@ -64,11 +65,27 @@ class BloomFilter:
 
     @classmethod
     def from_bytes(cls, data: bytes) -> BloomFilter:
-        """Deserialize a filter from *data*."""
+        """Deserialize a filter from *data*.
+
+        Raises :class:`CorruptRecordError` if data is truncated.
+        """
+        if len(data) < _HEADER_SIZE:
+            raise CorruptRecordError(
+                f"Bloom filter data too short: {len(data)} < {_HEADER_SIZE}"
+            )
         num_hashes, bit_count, seed, _ = _HEADER_STRUCT.unpack_from(data)
+        expected_bytes = (bit_count + 7) // 8
+        actual_bytes = len(data) - _HEADER_SIZE
+        if actual_bytes < expected_bytes:
+            raise CorruptRecordError(
+                f"Bloom filter truncated: "
+                f"need {expected_bytes}, have {actual_bytes}"
+            )
         obj = cls.__new__(cls)
         obj._num_hashes = num_hashes
         obj._bit_count = bit_count
         obj._seed = seed
-        obj._bits = bytearray(data[_HEADER_SIZE:])
+        obj._bits = bytearray(
+            data[_HEADER_SIZE : _HEADER_SIZE + expected_bytes],
+        )
         return obj

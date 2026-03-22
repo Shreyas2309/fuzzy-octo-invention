@@ -67,7 +67,15 @@ class SSTableRegistry:
             logger.info("Reader cleaned up", file_id=file_id)
 
     def close_all(self) -> None:
-        """Close all readers immediately."""
+        """Close idle readers and mark in-use readers for deferred cleanup."""
         with self._lock:
             for file_id in list(self._readers):
-                self._cleanup(file_id)
+                if self._refcounts.get(file_id, 0) == 0:
+                    self._cleanup(file_id)
+                else:
+                    self._marked.add(file_id)
+                    logger.warning(
+                        "Reader deferred (in use)",
+                        file_id=file_id,
+                        refcount=self._refcounts[file_id],
+                    )

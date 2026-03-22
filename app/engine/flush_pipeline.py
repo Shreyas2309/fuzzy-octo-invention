@@ -33,6 +33,7 @@ class FlushSlot:
     file_id: FileID
     prev_committed: asyncio.Event
     my_committed: asyncio.Event = field(default_factory=asyncio.Event)
+    batch_abort: asyncio.Event = field(default_factory=asyncio.Event)
     position: int = 0
 
 
@@ -58,78 +59,88 @@ class FlushPipeline:
         self._semaphore = asyncio.Semaphore(max_workers)
         self._stop_event = asyncio.Event()
         self._running = False
+        # BUG-14: async event bridged from threading.Event via
+        # loop.call_soon_threadsafe in the notify callback
+        self._flush_async = asyncio.Event()
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     # ── main loop ───────────────────────────────────────────────────────
 
     async def run(self) -> None:
         """Main daemon loop — runs until :meth:`stop` is called."""
         self._running = True
+        self._loop = asyncio.get_running_loop()
+
+        # BUG-14: register callback so threading.Event bridges to async
+        self._mem.set_flush_notify(self._on_flush_notify)
+
         logger.info("FlushPipeline started", max_workers=self._max_workers)
 
         while not self._stop_event.is_set():
             dispatched = await self._dispatch_all()
             if not dispatched:
-                # No work — wait for flush event or stop
+                # No work — wait for async flush signal or stop
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(
-                        self._wait_for_work(),
+                        self._flush_async.wait(),
                         timeout=0.5,
                     )
+                self._flush_async.clear()
 
         # Final drain on shutdown
         await self._dispatch_all()
+        self._mem.set_flush_notify(None)
         self._running = False
         logger.info("FlushPipeline stopped")
 
-    async def _wait_for_work(self) -> None:
-        """Wait until flush_event is set or stop is requested."""
-        flush_event = self._mem.flush_event
-        while not flush_event.is_set() and not self._stop_event.is_set():
-            await asyncio.sleep(0.05)
-        flush_event.clear()
+    def _on_flush_notify(self) -> None:
+        """Callback from MemTableManager (sync thread) to wake the loop."""
+        if self._loop is not None:
+            self._loop.call_soon_threadsafe(self._flush_async.set)
 
     # ── dispatch ────────────────────────────────────────────────────────
 
     async def _dispatch_all(self) -> bool:
         """Assign slots for all pending snapshots and flush them."""
-        queue_len = self._mem.queue_len()
-        if queue_len == 0:
+        # BUG-03: use snapshot_queue() to avoid TOCTOU race
+        pending = self._mem.snapshot_queue()
+        if not pending:
             return False
 
-        # Build slots for all pending snapshots
+        # Build slots for all pending snapshots (oldest first).
+        # All slots share one batch_abort event — if any slot fails,
+        # all downstream slots skip their commit (no wrong pops).
         slots: list[FlushSlot] = []
         prev_event = asyncio.Event()
         prev_event.set()  # first slot has no predecessor
+        abort_event = asyncio.Event()
 
-        for depth in range(queue_len):
-            snapshot = self._mem.peek_at_depth(depth)
-            if snapshot is None:
-                break
-
+        for depth, snapshot in enumerate(pending):
             file_id = self._sst.new_file_id()
             slot = FlushSlot(
                 snapshot=snapshot,
                 file_id=file_id,
                 prev_committed=prev_event,
+                batch_abort=abort_event,
                 position=depth,
             )
             slots.append(slot)
             prev_event = slot.my_committed
 
-        if not slots:
-            return False
-
         logger.info(
             "Dispatching flush",
             slot_count=len(slots),
-            queue_len=queue_len,
+            queue_len=len(pending),
         )
 
         # Launch all slots concurrently
         tasks = [asyncio.create_task(self._flush_slot(s)) for s in slots]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Check for errors
+        # BUG-13: count and log failures
+        failures = sum(
+            1 for r in results if isinstance(r, BaseException)
+        )
         for i, result in enumerate(results):
             if isinstance(result, BaseException):
                 logger.error(
@@ -139,17 +150,51 @@ class FlushPipeline:
                     error=str(result),
                 )
 
+        if failures:
+            logger.warning(
+                "Flush dispatch had failures",
+                total=len(slots),
+                failed=failures,
+            )
+
         return True
 
     # ── per-slot flush ──────────────────────────────────────────────────
 
     async def _flush_slot(self, slot: FlushSlot) -> None:
-        """Phase 1: write SSTable (parallel). Phase 2: commit (serialized)."""
-        async with self._semaphore:
-            meta, reader = await self._write_sstable(slot)
+        """Phase 1: write SSTable (parallel). Phase 2: commit (serialized).
 
-        # Phase 2: wait for previous slot to commit, then commit ours
-        await self._commit_slot(slot, meta, reader)
+        BUG-01 fix: on failure, sets ``batch_abort`` so downstream slots
+        skip their commits (no wrong pops), then signals ``my_committed``
+        to unblock the chain.
+        """
+        try:
+            # Abort early if a predecessor already failed
+            if slot.batch_abort.is_set():
+                logger.warning(
+                    "Flush slot skipped (batch aborted)",
+                    file_id=slot.file_id,
+                    position=slot.position,
+                )
+                return
+
+            async with self._semaphore:
+                meta, reader = await self._write_sstable(slot)
+
+            # Phase 2: wait for previous slot to commit, then commit ours
+            await self._commit_slot(slot, meta, reader)
+        except Exception:
+            # Signal all downstream slots to abort
+            slot.batch_abort.set()
+            logger.exception(
+                "Flush slot error — batch aborted",
+                file_id=slot.file_id,
+                position=slot.position,
+            )
+            raise
+        finally:
+            # ALWAYS signal downstream — prevents event chain deadlock
+            slot.my_committed.set()
 
     async def _write_sstable(
         self, slot: FlushSlot,
@@ -181,6 +226,15 @@ class FlushPipeline:
         # Wait for previous slot to finish committing
         await slot.prev_committed.wait()
 
+        # Double-check: predecessor may have failed after signalling
+        if slot.batch_abort.is_set():
+            reader.close()
+            logger.warning(
+                "Flush commit skipped (batch aborted)",
+                file_id=slot.file_id,
+            )
+            return
+
         sst_dir = self._sst.sst_dir_for(slot.file_id)
         self._sst.commit(slot.file_id, reader, sst_dir)
 
@@ -201,9 +255,6 @@ class FlushPipeline:
             file_id=slot.file_id,
             position=slot.position,
         )
-
-        # Signal next slot
-        slot.my_committed.set()
 
     # ── control ─────────────────────────────────────────────────────────
 

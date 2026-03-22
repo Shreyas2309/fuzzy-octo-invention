@@ -156,6 +156,8 @@ class LSMEngine:
             max_workers=max_workers,
         )
         engine._pipeline_task = asyncio.create_task(engine._pipeline.run())
+        # BUG-13: detect pipeline crash via done callback
+        engine._pipeline_task.add_done_callback(engine._on_pipeline_done)
 
         # 9. Ready
         logger.info(
@@ -169,6 +171,8 @@ class LSMEngine:
         return engine
 
     # ── write path ────────────────────────────────────────────────────────
+    # BUG-18 LOCK ORDER: _mem.write_lock → WALManager._wal_lock
+    # Never acquire _mem.write_lock while holding _wal_lock.
 
     async def put(self, key: Key, value: Value) -> None:
         """Write a key-value pair.
@@ -483,6 +487,17 @@ class LSMEngine:
         )
 
     # ── internal helpers ──────────────────────────────────────────────────
+
+    def _on_pipeline_done(self, task: asyncio.Task[None]) -> None:
+        """BUG-13: detect pipeline crash so failures aren't silent."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.critical(
+                "FlushPipeline crashed — flushes stopped",
+                error=str(exc),
+            )
 
     def _check_closed(self) -> None:
         """Raise if the engine has been closed."""

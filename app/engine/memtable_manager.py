@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import threading
 from collections import deque
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from app.common.errors import FreezeBackpressureTimeout, MemTableRestoreError
@@ -41,6 +42,8 @@ class MemTableManager:
         self._write_lock = threading.RLock()
         self._queue_not_full = threading.Condition(self._write_lock)
         self._flush_event = threading.Event()
+        # BUG-14: optional callback to bridge flush signal to asyncio
+        self._flush_notify: Callable[[], None] | None = None
 
     # ── write path ────────────────────────────────────────────────────────
 
@@ -64,15 +67,20 @@ class MemTableManager:
     def get(self, key: Key) -> tuple[SeqNum, Value] | None:
         """Look up *key* in active memtable then immutable queue.
 
-        Scans newest → oldest.  No lock acquired.  Returns raw value
-        including TOMBSTONE — the engine resolves it.
+        Scans newest → oldest.  Returns raw value including TOMBSTONE —
+        the engine resolves it.  Takes a snapshot copy of the immutable
+        queue to avoid concurrent-modification issues (BUG-02).
         """
         result = self._active.get(key)
         if result is not None:
             logger.debug("MemTableManager get", key=key, source="active")
             return result
 
-        for i, table in enumerate(self._immutable_q):
+        # BUG-02: snapshot the queue to avoid mutation during iteration.
+        # deque copy is O(n) but n ≤ immutable_queue_max_len (default 4).
+        snapshot = list(self._immutable_q)
+
+        for i, table in enumerate(snapshot):
             result = table.get(key)
             if result is not None:
                 logger.debug(
@@ -151,6 +159,8 @@ class MemTableManager:
         self._immutable_q.appendleft(snapshot)
         self._active = ActiveMemTable()
         self._flush_event.set()
+        if self._flush_notify is not None:
+            self._flush_notify()
 
         logger.info(
             "Freeze complete",
@@ -202,6 +212,8 @@ class MemTableManager:
         self._immutable_q.appendleft(snapshot)
         self._active = ActiveMemTable()
         self._flush_event.set()
+        if self._flush_notify is not None:
+            self._flush_notify()
 
         logger.info(
             "Force freeze complete",
@@ -221,12 +233,20 @@ class MemTableManager:
     def peek_at_depth(self, depth: int) -> ImmutableMemTable | None:
         """Return the snapshot at *depth* (0 = oldest, 1 = second oldest, etc.).
 
-        The snapshot stays in the queue — used by FlushPipeline to read
-        without creating a gap.
+        Protected by ``_write_lock`` to prevent TOCTOU race (BUG-03).
         """
-        if depth >= len(self._immutable_q):
-            return None
-        return self._immutable_q[-(depth + 1)]
+        with self._write_lock:
+            if depth >= len(self._immutable_q):
+                return None
+            return self._immutable_q[-(depth + 1)]
+
+    def snapshot_queue(self) -> list[ImmutableMemTable]:
+        """Return a snapshot of the immutable queue (oldest first).
+
+        Used by the flush pipeline to safely iterate all pending
+        snapshots without holding a lock during the flush.
+        """
+        return list(reversed(self._immutable_q))
 
     def pop_oldest(self) -> None:
         """Remove the oldest snapshot and unblock any stalled freeze."""
@@ -275,6 +295,14 @@ class MemTableManager:
     def flush_event(self) -> threading.Event:
         """The event signalled when a new snapshot is added to the queue."""
         return self._flush_event
+
+    def set_flush_notify(self, callback: Callable[[], None] | None) -> None:
+        """Register (or clear) a callback invoked after each freeze.
+
+        Used by FlushPipeline to bridge the sync flush_event to an
+        asyncio.Event via ``loop.call_soon_threadsafe`` (BUG-14).
+        """
+        self._flush_notify = callback
 
     @property
     def write_lock(self) -> threading.RLock:

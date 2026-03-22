@@ -28,6 +28,7 @@ logger = get_logger(__name__)
 
 class _State(enum.Enum):
     OPEN = "OPEN"
+    FINISHING = "FINISHING"
     DONE = "DONE"
 
 
@@ -143,7 +144,10 @@ class SSTableWriter:
 
     async def finish(self) -> SSTableMeta:
         """Finalize the SSTable (async). Bloom + index written concurrently."""
-        self._flush_remaining()
+        if self._state is not _State.OPEN:
+            raise SSTableWriteError("Writer is not in OPEN state")
+        self._state = _State.FINISHING
+        self._flush_block_and_close()
 
         bloom_bytes = self._bloom.to_bytes()
         index_bytes = self._index.to_bytes()
@@ -158,7 +162,10 @@ class SSTableWriter:
 
     def finish_sync(self) -> SSTableMeta:
         """Finalize the SSTable (sync). For L1+ subprocess use."""
-        self._flush_remaining()
+        if self._state is not _State.OPEN:
+            raise SSTableWriteError("Writer is not in OPEN state")
+        self._state = _State.FINISHING
+        self._flush_block_and_close()
 
         self._write_file(self._filter_path, self._bloom.to_bytes())
         self._write_file(self._index_path, self._index.to_bytes())
@@ -180,10 +187,14 @@ class SSTableWriter:
         self._block_buf_count = 0
         self._block_first_key = None
 
-    def _flush_remaining(self) -> None:
-        """Flush any remaining buffered records and close data file."""
-        if self._state is not _State.OPEN:
-            raise SSTableWriteError("Writer is not in OPEN state")
+    def _flush_block_and_close(self) -> None:
+        """Flush remaining buffered records and close data file.
+
+        Rejects empty SSTables (no records written via put).
+        """
+        if self._record_count == 0:
+            self._data_fd.close()
+            raise SSTableWriteError("Cannot finish an empty SSTable")
 
         self._flush_block()
         self._data_fd.flush()

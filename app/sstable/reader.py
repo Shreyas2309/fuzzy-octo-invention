@@ -6,7 +6,9 @@ Provides point lookups: bloom → sparse index bisect → mmap scan.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import mmap
+import os
 from pathlib import Path
 
 from app.bloom.filter import BloomFilter
@@ -31,7 +33,7 @@ class SSTableReader:
         index: SparseIndex,
         bloom: BloomFilter,
         cache: BlockCache | None,
-        mm: mmap.mmap,
+        mm: mmap.mmap | None,
         fd: int,
     ) -> None:
         self._dir = directory
@@ -76,16 +78,19 @@ class SSTableReader:
         index = SparseIndex.from_bytes(index_data)
         bloom = BloomFilter.from_bytes(bloom_data)
 
-        # mmap the data file
+        # mmap the data file (BUG-06: fd protected by try/except)
         data_path = directory / meta.data_file
-        import os
-
         fd = os.open(str(data_path), os.O_RDONLY)
-        size = os.fstat(fd).st_size
-        if size == 0:
-            mm = mmap.mmap(-1, 1)  # empty placeholder
-        else:
-            mm = mmap.mmap(fd, 0, access=mmap.ACCESS_READ)
+        try:
+            size = os.fstat(fd).st_size
+            # BUG-07: Use None for empty files instead of anonymous mmap
+            if size == 0:
+                mm: mmap.mmap | None = None
+            else:
+                mm = mmap.mmap(fd, 0, access=mmap.ACCESS_READ)
+        except Exception:
+            os.close(fd)
+            raise
 
         reader = cls(
             directory=directory,
@@ -113,6 +118,10 @@ class SSTableReader:
 
         Flow: bloom check → sparse index bisect → block scan.
         """
+        # Empty SSTable (BUG-07)
+        if self._mm is None:
+            return None
+
         # 1. Bloom filter — fast negative
         if not self._bloom.may_contain(key):
             return None
@@ -125,10 +134,30 @@ class SSTableReader:
         # 3. Determine block end (next block offset or EOF)
         block_end = self._find_block_end(block_offset)
 
-        # 4. Scan the block
-        mv = memoryview(self._mm)
+        # 4. Check block cache before scanning (BUG-09)
+        block_data: bytes | None = None
+        if self._cache is not None:
+            block_data = self._cache.get(self._file_id, block_offset)
+
+        if block_data is not None:
+            mv = memoryview(block_data)
+            scan_start = 0
+            scan_end = len(block_data)
+        else:
+            mv = memoryview(self._mm)
+            scan_start = block_offset
+            scan_end = block_end
+            # Populate cache on miss
+            if self._cache is not None:
+                self._cache.put(
+                    self._file_id,
+                    block_offset,
+                    bytes(self._mm[block_offset:block_end]),
+                )
+
+        # 5. Scan the block
         best: tuple[SeqNum, int, Value] | None = None
-        for rec in iter_block(mv, block_offset, block_end):
+        for rec in iter_block(mv, scan_start, scan_end):
             if rec.key == key:
                 if best is None or rec.seq > best[0]:
                     best = (rec.seq, rec.timestamp_ms, rec.value)
@@ -142,7 +171,7 @@ class SSTableReader:
 
         Used by the ``disk`` command to display SSTable contents.
         """
-        if self._meta.size_bytes == 0:
+        if self._mm is None or self._meta.size_bytes == 0:
             return []
         mv = memoryview(self._mm)
         return [
@@ -161,11 +190,9 @@ class SSTableReader:
 
     def close(self) -> None:
         """Release mmap and file descriptor. Never raises."""
-        import contextlib
-        import os
-
-        with contextlib.suppress(Exception):
-            self._mm.close()
+        if self._mm is not None:
+            with contextlib.suppress(Exception):
+                self._mm.close()
         with contextlib.suppress(Exception):
             os.close(self._fd)
 

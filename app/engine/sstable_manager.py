@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -112,6 +113,7 @@ class SSTableManager:
         self._manifest = manifest
         self._config = config
         self._max_seq: SeqNum = 0
+        self._state_lock = threading.Lock()  # guards _l0_order + _max_seq
 
     # ── factory ─────────────────────────────────────────────────────────
 
@@ -261,10 +263,11 @@ class SSTableManager:
     def commit(self, file_id: FileID, reader: SSTableReader, sst_dir: Path) -> None:
         """Register a flushed SSTable, update L0 order, and persist manifest."""
         self._registry.register(file_id, reader)
-        self._l0_order.insert(0, file_id)  # newest first
-        self._l0_dirs[file_id] = sst_dir
-        if reader.meta.seq_max > self._max_seq:
-            self._max_seq = reader.meta.seq_max
+        with self._state_lock:
+            self._l0_order.insert(0, file_id)  # newest first
+            self._l0_dirs[file_id] = sst_dir
+            if reader.meta.seq_max > self._max_seq:
+                self._max_seq = reader.meta.seq_max
 
         # Persist the new order atomically
         self._manifest.write(self._l0_order)
@@ -278,10 +281,18 @@ class SSTableManager:
     # ── read path ───────────────────────────────────────────────────────
 
     async def get(self, key: Key) -> tuple[SeqNum, int, Value] | None:
-        """Look up *key* across all L0 SSTables (newest first)."""
-        best: tuple[SeqNum, int, Value] | None = None
+        """Look up *key* across all L0 SSTables (newest first).
 
-        for file_id in self._l0_order:
+        BUG-12: Reads are serial (mmap is microseconds, asyncio.gather
+        overhead would exceed the benefit). Lock-snapshot ensures safe
+        iteration during concurrent commits.
+        """
+        # BUG-08: snapshot under lock to avoid concurrent modification
+        with self._state_lock:
+            order = list(self._l0_order)
+
+        best: tuple[SeqNum, int, Value] | None = None
+        for file_id in order:
             try:
                 with self._registry.open_reader(file_id) as reader:
                     result = reader.get(key)

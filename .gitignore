@@ -21,7 +21,7 @@ wheels/
 .ruff_cache/
 
 # Runtime data
-data/
+data
 
 # Claude
 .claude/
