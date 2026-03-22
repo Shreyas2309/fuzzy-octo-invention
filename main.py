@@ -10,6 +10,7 @@ from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.styles import Style
 
 from app.engine import LSMEngine
+from app.types import TOMBSTONE
 
 STYLE = Style.from_dict({"prompt": "ansigreen bold italic"})
 
@@ -26,6 +27,7 @@ commands:
   stats                  show engine stats
   config                 show current config as JSON
   config set <k> <v>     update a config parameter
+  trace <key>            trace a lookup step-by-step
   help                   show this message
   exit / quit            exit the REPL
 
@@ -144,23 +146,26 @@ async def handle(engine: LSMEngine, line: str) -> None:
                     print(f"  seq={seq:<6}  {k_str} → {v_str}")
             else:
                 # Listing mode — by level
-                l0_tables = result.get("L0", [])
-                print(f"L0  ({len(l0_tables)} SSTables)")  # type: ignore[arg-type]
-                if not l0_tables:
-                    print("  (empty)")
-                for i, t in enumerate(l0_tables):  # type: ignore[union-attr]
-                    min_k = t.get("min_key", b"")  # type: ignore[union-attr]
-                    max_k = t.get("max_key", b"")  # type: ignore[union-attr]
-                    min_s = min_k.decode(errors="replace") if isinstance(min_k, bytes) else str(min_k)
-                    max_s = max_k.decode(errors="replace") if isinstance(max_k, bytes) else str(max_k)
-                    print(
-                        f"  [{i}] {t['file_id']}  "  # type: ignore[index]
-                        f"records={t['record_count']}  "  # type: ignore[index]
-                        f"blocks={t['block_count']}  "  # type: ignore[index]
-                        f"size={t['size_bytes']}B  "  # type: ignore[index]
-                        f"keys={min_s}..{max_s}  "
-                        f"seq={t['seq_min']}..{t['seq_max']}"  # type: ignore[index]
-                    )
+                for level_name in ("L0", "L1", "L2", "L3"):
+                    tables = result.get(level_name, [])
+                    if tables is None:
+                        continue
+                    print(f"{level_name}  ({len(tables)} SSTables)")  # type: ignore[arg-type]
+                    if not tables:
+                        print("  (empty)")
+                    for i, t in enumerate(tables):  # type: ignore[union-attr]
+                        min_k = t.get("min_key", b"")  # type: ignore[union-attr]
+                        max_k = t.get("max_key", b"")  # type: ignore[union-attr]
+                        min_s = min_k.decode(errors="replace") if isinstance(min_k, bytes) else str(min_k)
+                        max_s = max_k.decode(errors="replace") if isinstance(max_k, bytes) else str(max_k)
+                        print(
+                            f"  [{i}] {t['file_id']}  "  # type: ignore[index]
+                            f"records={t['record_count']}  "  # type: ignore[index]
+                            f"blocks={t['block_count']}  "  # type: ignore[index]
+                            f"size={t['size_bytes']}B  "  # type: ignore[index]
+                            f"keys={min_s}..{max_s}  "
+                            f"seq={t['seq_min']}..{t['seq_max']}"  # type: ignore[index]
+                        )
 
         case "flush":
             flushed = await engine.flush()
@@ -203,6 +208,141 @@ async def handle(engine: LSMEngine, line: str) -> None:
                     print(f"error: {exc}")
             else:
                 print("usage: config | config set <key> <value>")
+
+        case "trace":
+            if not args:
+                print("usage: trace <key>")
+                return
+            raw_key = args[0].encode()
+            steps: list[dict[str, object]] = []
+            found_value: bytes | None = None
+            found_source: str | None = None
+            found_seq: int | None = None
+            step_num = 0
+
+            # 1. Active memtable
+            step_num += 1
+            result = engine._mem._active.get(raw_key)
+            if result is not None:
+                seq, value = result
+                is_tomb = value == TOMBSTONE
+                tag = "TOMBSTONE" if is_tomb else "HIT"
+                print(f"  [{step_num}] active_memtable: {tag}  seq={seq}")
+                if not is_tomb:
+                    found_value, found_source, found_seq = value, "active_memtable", seq
+            else:
+                print(f"  [{step_num}] active_memtable: MISS")
+
+            # 2. Immutable snapshots
+            if found_value is None:
+                for i, table in enumerate(engine._mem._immutable_q):
+                    step_num += 1
+                    result = table.get(raw_key)
+                    if result is not None:
+                        seq, value = result
+                        is_tomb = value == TOMBSTONE
+                        tag = "TOMBSTONE" if is_tomb else "HIT"
+                        print(f"  [{step_num}] immutable_{i}: {tag}  seq={seq}")
+                        if not is_tomb:
+                            found_value, found_source, found_seq = value, f"immutable_{i}", seq
+                        break
+                    else:
+                        print(f"  [{step_num}] immutable_{i}: MISS")
+
+            # 3. L0 SSTables
+            if found_value is None:
+                with engine._sst._state_lock:
+                    l0_snap = list(engine._sst._l0_order)
+                for fid in l0_snap:
+                    step_num += 1
+                    try:
+                        with engine._sst._registry.open_reader(fid) as reader:
+                            reader._ensure_loaded()
+                            bloom_hit = reader._bloom.may_contain(raw_key)  # type: ignore[union-attr]
+                            if not bloom_hit:
+                                print(f"  [{step_num}] l0:{fid[:12]}: BLOOM_SKIP  bloom=negative")
+                                continue
+                            offset = reader._index.floor_offset(raw_key)  # type: ignore[union-attr]
+                            cache_hit = (
+                                reader._cache is not None
+                                and offset is not None
+                                and reader._cache.get(fid, offset) is not None
+                            )
+                            val = reader.get(raw_key)
+                            if val is not None:
+                                seq, _, value = val
+                                is_tomb = value == TOMBSTONE
+                                tag = "TOMBSTONE" if is_tomb else "FOUND"
+                                print(
+                                    f"  [{step_num}] l0:{fid[:12]}: {tag}  "
+                                    f"bloom=positive  offset={offset}  "
+                                    f"cache={'HIT' if cache_hit else 'MISS'}  seq={seq}"
+                                )
+                                if not is_tomb:
+                                    found_value, found_source, found_seq = value, f"l0:{fid[:12]}", seq
+                                break
+                            else:
+                                print(
+                                    f"  [{step_num}] l0:{fid[:12]}: MISS (false positive)  "
+                                    f"bloom=positive  offset={offset}  "
+                                    f"cache={'HIT' if cache_hit else 'MISS'}"
+                                )
+                    except KeyError:
+                        continue
+
+            # 4. L1+ SSTables
+            if found_value is None:
+                with engine._sst._state_lock:
+                    level_snap = dict(engine._sst._level_files)
+                for level in range(1, engine._sst.max_level + 1):
+                    entry = level_snap.get(level)
+                    if entry is None:
+                        continue
+                    fid, _ = entry
+                    step_num += 1
+                    try:
+                        with engine._sst._registry.open_reader(fid) as reader:
+                            reader._ensure_loaded()
+                            bloom_hit = reader._bloom.may_contain(raw_key)  # type: ignore[union-attr]
+                            if not bloom_hit:
+                                print(f"  [{step_num}] l{level}:{fid[:12]}: BLOOM_SKIP  bloom=negative")
+                                continue
+                            offset = reader._index.floor_offset(raw_key)  # type: ignore[union-attr]
+                            cache_hit = (
+                                reader._cache is not None
+                                and offset is not None
+                                and reader._cache.get(fid, offset) is not None
+                            )
+                            val = reader.get(raw_key)
+                            if val is not None:
+                                seq, _, value = val
+                                is_tomb = value == TOMBSTONE
+                                tag = "TOMBSTONE" if is_tomb else "FOUND"
+                                print(
+                                    f"  [{step_num}] l{level}:{fid[:12]}: {tag}  "
+                                    f"bloom=positive  offset={offset}  "
+                                    f"cache={'HIT' if cache_hit else 'MISS'}  seq={seq}"
+                                )
+                                if not is_tomb:
+                                    found_value, found_source, found_seq = value, f"l{level}:{fid[:12]}", seq
+                                break
+                            else:
+                                print(
+                                    f"  [{step_num}] l{level}:{fid[:12]}: MISS (false positive)  "
+                                    f"bloom=positive  offset={offset}  "
+                                    f"cache={'HIT' if cache_hit else 'MISS'}"
+                                )
+                    except KeyError:
+                        continue
+
+            # Result
+            if found_value is not None:
+                print(
+                    f"→ FOUND: \"{found_value.decode(errors='replace')}\" "
+                    f"(source={found_source}, seq={found_seq})"
+                )
+            else:
+                print("→ NOT FOUND")
 
         case "help":
             print(HELP)

@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import bisect
 
+from app.common import crc
 from app.common.encoding import decode_index_entries, encode_index_entry
+from app.common.errors import CorruptRecordError
 from app.types import Key, Offset
 
 
@@ -49,17 +51,34 @@ class SparseIndex:
         return self._offsets[idx]
 
     def to_bytes(self) -> bytes:
-        """Serialize all index entries to bytes."""
+        """Serialize all index entries to bytes with CRC footer."""
         parts: list[bytes] = []
         for key, offset in zip(self._keys, self._offsets, strict=True):
             parts.append(encode_index_entry(key, offset))
-        return b"".join(parts)
+        payload = b"".join(parts)
+        return payload + crc.pack(crc.compute(payload))
 
     @classmethod
     def from_bytes(cls, data: bytes) -> SparseIndex:
-        """Deserialize from *data*."""
+        """Deserialize from *data*. Verifies CRC integrity."""
+        if len(data) < crc.CRC_SIZE:
+            # Empty index (no entries, no CRC) is valid
+            if len(data) == 0:
+                return cls()
+            raise CorruptRecordError(
+                f"Index data too short for CRC: {len(data)}"
+            )
+
+        if len(data) == 0:
+            return cls()
+
+        payload = data[: -crc.CRC_SIZE]
+        stored_crc = crc.unpack(data, len(data) - crc.CRC_SIZE)
+        if not crc.verify(payload, stored_crc):
+            raise CorruptRecordError("Index CRC mismatch")
+
         obj = cls()
-        for key, offset in decode_index_entries(data):
+        for key, offset in decode_index_entries(payload):
             obj._keys.append(key)
             obj._offsets.append(offset)
         return obj

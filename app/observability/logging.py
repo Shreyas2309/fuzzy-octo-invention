@@ -83,6 +83,10 @@ _MODULE_SHORT: dict[str, str] = {
     "app.sstable.writer": "sst-wr",
     "app.sstable.reader": "sst-rd",
     "app.sstable.registry": "sst-reg",
+    "app.common.rwlock": "rwlock",
+    "app.common.merge_iterator": "merge",
+    "app.compaction.worker": "compact-w",
+    "app.engine.compaction_manager": "compact",
 }
 
 

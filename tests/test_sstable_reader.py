@@ -89,7 +89,7 @@ class TestSSTableReader:
         self, populated_sst: tuple[Path, str],
     ) -> None:
         sst_dir, file_id = populated_sst
-        cache = BlockCache(maxsize=32)
+        cache = BlockCache(data_maxsize=32)
         reader = await SSTableReader.open(sst_dir, file_id, cache=cache)
 
         result = reader.get(b"key_0003")

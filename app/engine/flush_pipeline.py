@@ -18,6 +18,7 @@ from app.sstable.reader import SSTableReader
 from app.types import FileID
 
 if TYPE_CHECKING:
+    from app.engine.compaction_manager import CompactionManager
     from app.engine.memtable_manager import MemTableManager
     from app.engine.sstable_manager import SSTableManager
     from app.engine.wal_manager import WALManager
@@ -51,11 +52,13 @@ class FlushPipeline:
         sst: SSTableManager,
         wal: WALManager,
         max_workers: int = 2,
+        compaction: CompactionManager | None = None,
     ) -> None:
         self._mem = mem
         self._sst = sst
         self._wal = wal
         self._max_workers = max_workers
+        self._compaction = compaction
         self._semaphore = asyncio.Semaphore(max_workers)
         self._stop_event = asyncio.Event()
         self._running = False
@@ -249,6 +252,14 @@ class FlushPipeline:
                 "WAL truncate failed after flush",
                 file_id=slot.file_id,
             )
+
+        # Trigger compaction check — non-blocking, independent task
+        if self._compaction is not None:
+            logger.debug(
+                "Triggering compaction check after flush",
+                file_id=slot.file_id,
+            )
+            asyncio.create_task(self._compaction.check_and_compact())
 
         logger.info(
             "Flush commit done",

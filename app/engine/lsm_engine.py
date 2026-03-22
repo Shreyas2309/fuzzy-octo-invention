@@ -15,6 +15,7 @@ from pathlib import Path
 
 from app.cache.block import BlockCache
 from app.common.errors import EngineClosed
+from app.engine.compaction_manager import CompactionManager
 from app.engine.config import LSMConfig
 from app.engine.flush_pipeline import FlushPipeline
 from app.engine.memtable_manager import MemTableManager
@@ -69,6 +70,7 @@ class LSMEngine:
         self._seq: SeqGenerator
         self._config: LSMConfig
         self._pipeline: FlushPipeline
+        self._compaction: CompactionManager | None = None
         self._pipeline_task: asyncio.Task[None] | None = None
         self._data_root: Path
         self._closed: bool = False
@@ -139,7 +141,11 @@ class LSMEngine:
         )
 
         # 6. SSTableManager — load existing SSTables from disk
-        cache = BlockCache()
+        cache = BlockCache(
+            data_maxsize=int(engine._config.cache_data_entry_limit),
+            index_maxsize=int(engine._config.cache_index_entry_limit),
+            bloom_maxsize=int(engine._config.cache_bloom_entry_limit),
+        )
         engine._sst = await SSTableManager.load(
             engine._data_root, cache, engine._config,
         )
@@ -147,19 +153,30 @@ class LSMEngine:
         # 7. Recovery — use max seq from SSTables + WAL
         engine._recover()
 
-        # 8. FlushPipeline — start as daemon task
+        # 8. CompactionManager + FlushPipeline — start as daemon task
+        engine._compaction = CompactionManager(
+            sst=engine._sst,
+            config=engine._config,
+            data_root=engine._data_root,
+        )
         max_workers = int(engine._config.flush_max_workers)
         engine._pipeline = FlushPipeline(
             mem=engine._mem,
             sst=engine._sst,
             wal=engine._wal,
             max_workers=max_workers,
+            compaction=engine._compaction,
         )
         engine._pipeline_task = asyncio.create_task(engine._pipeline.run())
-        # BUG-13: detect pipeline crash via done callback
         engine._pipeline_task.add_done_callback(engine._on_pipeline_done)
 
-        # 9. Ready
+        # 9. Startup compaction check (L0 may already be at threshold)
+        if engine._sst.l0_count >= int(
+            engine._config.l0_compaction_threshold,
+        ):
+            asyncio.create_task(engine._compaction.check_and_compact())
+
+        # 10. Ready
         logger.info(
             "Startup complete",
             data_root=str(engine._data_root),

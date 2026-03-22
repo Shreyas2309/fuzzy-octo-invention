@@ -77,3 +77,7 @@ class SSTableReadError(LSMError):
 
 class FlushError(LSMError):
     """Flush pipeline encountered an unrecoverable error."""
+
+
+class CompactionError(LSMError):
+    """Compaction job failed — subprocess error or I/O failure."""

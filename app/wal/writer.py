@@ -18,6 +18,7 @@ from pathlib import Path
 import msgpack  # pyright: ignore[reportMissingTypeStubs]
 import structlog
 
+from app.common import crc
 from app.common.errors import WALCorruptError, WALTruncateError
 from app.types import Key, OpType, SeqNum, Value
 
@@ -25,12 +26,18 @@ logger = structlog.get_logger(__name__)
 
 
 def _encode_entry(entry: WALEntry) -> bytes:
-    """Encode a WALEntry as msgpack bytes."""
-    result: bytes = msgpack.packb(  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType, reportAssignmentType]
+    """Encode a WALEntry as msgpack bytes with trailing CRC32."""
+    payload: bytes = msgpack.packb(  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType, reportAssignmentType]
         (entry.seq, entry.timestamp_ms, int(entry.op), entry.key, entry.value),
         use_bin_type=True,
     )
-    return result
+    # Frame: [4-byte payload length][payload][4-byte CRC of payload]
+    length = len(payload)
+    return (
+        length.to_bytes(4, "big")
+        + payload
+        + crc.pack(crc.compute(payload))
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +118,9 @@ class WALWriter:
         """Read the WAL file and return all entries sorted by seq.
 
         Returns an empty list when the file does not exist or is empty.
-        Raises :class:`WALCorruptError` if decoding fails.
+        Raises :class:`WALCorruptError` if decoding or CRC check fails.
+
+        The framed format is: ``[4B length][payload][4B CRC]``.
         """
         logger.debug("WAL replay start", path=str(self._path))
 
@@ -122,18 +131,53 @@ class WALWriter:
         entries: list[WALEntry] = []
         try:
             with open(self._path, "rb") as fd:
-                unpacker = msgpack.Unpacker(fd, raw=True)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
-                for item in unpacker:  # pyright: ignore[reportUnknownVariableType]
-                    raw_seq, raw_ts, raw_op, raw_key, raw_value = item  # pyright: ignore[reportUnknownVariableType]
-                    entries.append(
-                        WALEntry(
-                            seq=int(raw_seq),  # pyright: ignore[reportUnknownArgumentType]
-                            timestamp_ms=int(raw_ts),  # pyright: ignore[reportUnknownArgumentType]
-                            op=OpType(int(raw_op)),  # pyright: ignore[reportUnknownArgumentType]
-                            key=bytes(raw_key),  # pyright: ignore[reportUnknownArgumentType]
-                            value=bytes(raw_value),  # pyright: ignore[reportUnknownArgumentType]
-                        )
+                data = fd.read()
+            pos = 0
+            while pos < len(data):
+                # Read 4-byte length prefix
+                if pos + 4 > len(data):
+                    raise WALCorruptError(
+                        f"Truncated length at offset {pos}"
                     )
+                payload_len = int.from_bytes(
+                    data[pos : pos + 4], "big",
+                )
+                pos += 4
+
+                # Read payload
+                if pos + payload_len > len(data):
+                    raise WALCorruptError(
+                        f"Truncated payload at offset {pos - 4}"
+                    )
+                payload = data[pos : pos + payload_len]
+                pos += payload_len
+
+                # Read and verify CRC
+                if pos + crc.CRC_SIZE > len(data):
+                    raise WALCorruptError(
+                        f"Truncated CRC at offset {pos}"
+                    )
+                stored = crc.unpack(data, pos)
+                if not crc.verify(payload, stored):
+                    raise WALCorruptError(
+                        f"CRC mismatch at offset {pos - payload_len - 4}"
+                    )
+                pos += crc.CRC_SIZE
+
+                # Decode msgpack payload
+                item = msgpack.unpackb(payload, raw=True)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+                raw_seq, raw_ts, raw_op, raw_key, raw_value = item  # pyright: ignore[reportUnknownVariableType]
+                entries.append(
+                    WALEntry(
+                        seq=int(raw_seq),  # pyright: ignore[reportUnknownArgumentType]
+                        timestamp_ms=int(raw_ts),  # pyright: ignore[reportUnknownArgumentType]
+                        op=OpType(int(raw_op)),  # pyright: ignore[reportUnknownArgumentType]
+                        key=bytes(raw_key),  # pyright: ignore[reportUnknownArgumentType]
+                        value=bytes(raw_value),  # pyright: ignore[reportUnknownArgumentType]
+                    )
+                )
+        except WALCorruptError:
+            raise
         except (msgpack.UnpackException, ValueError, TypeError) as exc:
             raise WALCorruptError(
                 f"Failed to decode WAL at {self._path}: {exc}"

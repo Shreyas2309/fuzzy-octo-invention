@@ -40,6 +40,11 @@ _DEFAULTS: dict[str, int | float | str] = {
     "compaction_check_interval": 0.5,
     "block_size": 4096,
     "flush_max_workers": 2,
+    "compaction_max_workers": 1,
+    "max_levels": 3,
+    "cache_data_entry_limit": 256,
+    "cache_index_entry_limit": 64,
+    "cache_bloom_entry_limit": 64,
 }
 
 _VALID_ENV_VALUES: set[str] = {"dev", "prod"}

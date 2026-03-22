@@ -12,6 +12,7 @@ from typing import Final
 
 import mmh3
 
+from app.common import crc
 from app.common.errors import CorruptRecordError
 from app.types import Key
 
@@ -57,25 +58,38 @@ class BloomFilter:
         return True
 
     def to_bytes(self) -> bytes:
-        """Serialize the filter to bytes."""
+        """Serialize the filter to bytes with CRC footer."""
         header = _HEADER_STRUCT.pack(
             self._num_hashes, self._bit_count, self._seed, 0,
         )
-        return header + bytes(self._bits)
+        payload = header + bytes(self._bits)
+        return payload + crc.pack(crc.compute(payload))
 
     @classmethod
     def from_bytes(cls, data: bytes) -> BloomFilter:
         """Deserialize a filter from *data*.
 
-        Raises :class:`CorruptRecordError` if data is truncated.
+        Raises :class:`CorruptRecordError` if data is truncated or
+        CRC verification fails.
         """
-        if len(data) < _HEADER_SIZE:
+        min_size = _HEADER_SIZE + crc.CRC_SIZE
+        if len(data) < min_size:
             raise CorruptRecordError(
-                f"Bloom filter data too short: {len(data)} < {_HEADER_SIZE}"
+                f"Bloom filter data too short: "
+                f"{len(data)} < {min_size}"
             )
-        num_hashes, bit_count, seed, _ = _HEADER_STRUCT.unpack_from(data)
+
+        # Verify CRC (covers header + bit array)
+        payload = data[: -crc.CRC_SIZE]
+        stored_crc = crc.unpack(data, len(data) - crc.CRC_SIZE)
+        if not crc.verify(payload, stored_crc):
+            raise CorruptRecordError("Bloom filter CRC mismatch")
+
+        num_hashes, bit_count, seed, _ = _HEADER_STRUCT.unpack_from(
+            payload,
+        )
         expected_bytes = (bit_count + 7) // 8
-        actual_bytes = len(data) - _HEADER_SIZE
+        actual_bytes = len(payload) - _HEADER_SIZE
         if actual_bytes < expected_bytes:
             raise CorruptRecordError(
                 f"Bloom filter truncated: "
@@ -86,6 +100,6 @@ class BloomFilter:
         obj._bit_count = bit_count
         obj._seed = seed
         obj._bits = bytearray(
-            data[_HEADER_SIZE : _HEADER_SIZE + expected_bytes],
+            payload[_HEADER_SIZE : _HEADER_SIZE + expected_bytes],
         )
         return obj
