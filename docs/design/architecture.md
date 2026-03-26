@@ -84,20 +84,4 @@ Entries already flushed to SSTables are skipped. The WAL is the source of truth 
 
 ## Architecture Diagram
 
-```mermaid
-graph TD
-    ENGINE["<b>LSMEngine</b><br/>put() &nbsp; get() &nbsp; delete() &nbsp; close()"]
-
-    ENGINE -->|atomic write lock| WAL["<b>WALManager</b><br/>sync fsync"]
-    ENGINE -->|atomic write lock| SEQ["<b>SeqGenerator</b><br/>monotonic counter"]
-    ENGINE -->|atomic write lock| MEM["<b>MemTableManager</b><br/>active + immutable queue"]
-
-    MEM -->|freeze signal| FLUSH["<b>FlushPipeline</b><br/>parallel write + ordered commit"]
-    FLUSH -->|commit| SST["<b>SSTableManager</b><br/>L0 + L1 + L2 + L3<br/>manifest + block cache"]
-    SST -->|trigger| COMPACT["<b>CompactionManager</b><br/>subprocess merge<br/>level reservation"]
-    COMPACT -->|atomic commit| SST
-
-    ENGINE -.->|read path| MEM
-    ENGINE -.->|read path| SST
-
-```
+![Architecture diagram](images/architecture.svg)

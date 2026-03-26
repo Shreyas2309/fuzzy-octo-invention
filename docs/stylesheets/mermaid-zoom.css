@@ -1,0 +1,99 @@
+/* Mermaid Diagram Pan & Zoom Styles */
+
+/* Wrapper: visible interactive canvas */
+.mermaid-zoom-wrapper {
+  position: relative;
+  border: 1px solid var(--md-default-fg-color--lightest);
+  border-radius: 8px;
+  overflow: hidden;
+  margin: 1.5em 0;
+  background: var(--md-code-bg-color);
+}
+
+/* Viewport: the scrollable/pannable area */
+.mermaid-zoom-viewport {
+  overflow: hidden;
+  min-height: 300px;
+  max-height: 80vh;
+  margin: 0;
+  padding: 1.5em;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* SVG: allow transform, remove size constraints */
+.mermaid-zoom-viewport svg {
+  transition: transform 0.1s ease-out;
+  max-width: none !important;
+  max-height: none !important;
+}
+
+/* Zoom control buttons */
+.mermaid-zoom-controls {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: flex;
+  gap: 4px;
+  z-index: 10;
+  opacity: 0.6;
+  transition: opacity 0.2s;
+}
+
+.mermaid-zoom-wrapper:hover .mermaid-zoom-controls {
+  opacity: 1;
+}
+
+.mermaid-zoom-btn {
+  background: var(--md-default-bg-color);
+  color: var(--md-default-fg-color);
+  border: 1px solid var(--md-default-fg-color--lightest);
+  border-radius: 4px;
+  width: 32px;
+  height: 32px;
+  font-size: 18px;
+  font-weight: 600;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s, border-color 0.15s;
+  line-height: 1;
+  padding: 0;
+}
+
+.mermaid-zoom-btn:hover {
+  background: var(--md-accent-fg-color);
+  color: var(--md-accent-bg-color);
+  border-color: var(--md-accent-fg-color);
+}
+
+.mermaid-zoom-btn.mermaid-zoom-reset {
+  width: auto;
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+}
+
+/* Hint text */
+.mermaid-zoom-wrapper::after {
+  content: "Scroll to zoom \00B7 Drag to pan \00B7 Double-click to reset";
+  position: absolute;
+  bottom: 6px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 11px;
+  color: var(--md-default-fg-color--light);
+  opacity: 0;
+  transition: opacity 0.2s;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.mermaid-zoom-wrapper:hover::after {
+  opacity: 0.7;
+}
