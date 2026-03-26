@@ -87,6 +87,7 @@ nav:
     - Observability: internals/observability.md
   - Design Docs:
     - Architecture: design/architecture.md
+    - Write Optimizations: design/write-optimizations.md
     - Read & Write Flow: design/read-write-flow.md
     - MemTable: design/memtable-impl.md
     - MemTable Manager: design/memtable-manager.md
@@ -94,7 +95,7 @@ nav:
     - SSTable Manager: design/sstable-manager.md
     - Common Components: design/common-components.md
     - Async I/O Integration: design/async-io.md
-    - Async I/O Guidelines: design/async-io-guidelines.md
+    # - Async I/O Guidelines: design/async-io-guidelines.md
     - Flush Pipeline: design/flush-pipeline.md
     - Parallel Flush: design/parallel-flush.md
     - Compaction Spec: design/compaction-spec.md
